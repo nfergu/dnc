@@ -26,13 +26,15 @@ PLANNING_STEPS = 10
 DEBUG = False
 SHOW = False
 
-# These constants be changed without changing the code that relies on them
+# These constants cannot be changed without changing the code that relies on them
 INPUT_VECTOR_SIZE = 92
 TRANSITION_CHANNEL_INDEX = 90
 ANSWER_CHANNEL_INDEX = 91
 TARGET_VECTOR_SIZE = 90
 
 NUM_DIGITS = 9
+
+BATCH_SIZE = 16
 
 FLAGS = tf.flags.FLAGS
 
@@ -54,11 +56,11 @@ tf.flags.DEFINE_float("optimizer_epsilon", 1e-10,
 # Training options.
 tf.flags.DEFINE_integer("num_training_iterations", 100000,
                         "Number of iterations to train for.")
-tf.flags.DEFINE_integer("report_interval", 1,
+tf.flags.DEFINE_integer("report_interval", 10,
                         "Iterations between reports (samples, valid loss).")
 tf.flags.DEFINE_string("checkpoint_dir", "/tmp/tf/dnc",
                        "Checkpointing directory.")
-tf.flags.DEFINE_integer("checkpoint_interval", -1,
+tf.flags.DEFINE_integer("checkpoint_interval", 100,
                         "Checkpointing step interval.")
 
 
@@ -276,17 +278,24 @@ def print_edges(graph):
               .format(from_node, to_node, node_data))
 
 
-def generate_data(graph_size):
-    graph = generate_graph(graph_size, MAX_NODE_NEIGHBOURS)
-    if DEBUG:
-        print_edges(graph)
-    if SHOW:
-        show_graph(graph)
-    observation_data, target_data = get_training_data(graph)
-    num_time_steps = len(observation_data)
-    print('Num time steps: {0}'.format(num_time_steps))
-    # TODO: We currently hard-code a single batch here. Change this to generate multiple batches
-    return np.asarray([observation_data]), np.asarray([target_data]), num_time_steps
+def generate_data(graph_size, batch_size):
+    observation_batch = []
+    target_batch = []
+    for i in range(batch_size):
+        debug('Generating graph for batch index {0}'.format(i))
+        graph = generate_graph(graph_size, MAX_NODE_NEIGHBOURS)
+        if DEBUG:
+            print_edges(graph)
+        if SHOW:
+            show_graph(graph)
+        observation_data, target_data = get_training_data(graph)
+        observation_batch.append(observation_data)
+        target_batch.append(target_data)
+    num_time_steps = len(observation_batch[0])
+    debug('Num time steps: {0}'.format(num_time_steps))
+    for observation in observation_batch:
+        assert len(observation) == num_time_steps
+    return np.asarray(observation_batch), np.asarray(target_batch), num_time_steps
 
 
 def run_model(training_data, output_size):
@@ -304,7 +313,7 @@ def run_model(training_data, output_size):
     clip_value = FLAGS.clip_value
 
     dnc_core = dnc.DNC(access_config, controller_config, output_size, clip_value)
-    initial_state = dnc_core.initial_state(batch_size=1)
+    initial_state = dnc_core.initial_state(batch_size=BATCH_SIZE)
     output_sequence, _ = tf.nn.dynamic_rnn(
         cell=dnc_core,
         inputs=training_data,
@@ -414,6 +423,9 @@ def assert_shape(array_or_tensor, shape):
                                  'has shape {1}, but expected shape is shape {2}.'
                                  .format(i, array_or_tensor.shape, shape))
 
+    if DEBUG:
+        print('Array {0} has shape of {1}'.format(array_or_tensor, shape))
+
 
 def debug(debug_string):
     if DEBUG:
@@ -467,14 +479,18 @@ def calculate_loss(output_tensor, target_tensor, mask_tensor, batch_size, num_ti
 
     # We can now compute the total loss for each item in the batch, simply by summing across
     # all time steps
-    total_loss = tf.reduce_sum(masked_loss, axis=1)
-    debug('Total loss: {0}'.format(total_loss))
-    assert_shape(total_loss, (batch_size,))
+    batch_loss = tf.reduce_sum(masked_loss, axis=1)
+    debug('Batch loss: {0}'.format(batch_loss))
+    assert_shape(batch_loss, (batch_size,))
 
-    return total_loss
+    mean_loss = tf.reduce_sum(batch_loss) / batch_size
+    debug('Mean loss: {0}'.format(mean_loss))
+    assert_shape(mean_loss, ())
+
+    return mean_loss
 
 
-def create_mask_tensor(observation_data):
+def create_mask_data(observation_data):
 
     mask_data = []
 
@@ -487,26 +503,27 @@ def create_mask_tensor(observation_data):
                 mask_for_batch.append(0)
         mask_data.append(mask_for_batch)
 
-    return tf.constant(mask_data, dtype=tf.float32)
+    return np.asarray(mask_data)
 
 
 def train(num_training_iterations, report_interval):
     """Trains the DNC and periodically reports the loss."""
 
-    batch_size = 1
+    # Generate an initial batch of data, just so we know the shape of the data
+    # for creating placeholders
+    observation_data, target_data, num_time_steps = generate_data(graph_size=GRAPH_SIZE,
+                                                                  batch_size=BATCH_SIZE)
 
-    observation_data, target_data, num_time_steps = generate_data(graph_size=GRAPH_SIZE)
-
-    mask_tensor = create_mask_tensor(observation_data)
-
-    assert_shape(observation_data, (batch_size, num_time_steps, INPUT_VECTOR_SIZE))
-    assert_shape(target_data, (batch_size, num_time_steps, TARGET_VECTOR_SIZE))
+    assert_shape(observation_data, (BATCH_SIZE, num_time_steps, INPUT_VECTOR_SIZE))
+    assert_shape(target_data, (BATCH_SIZE, num_time_steps, TARGET_VECTOR_SIZE))
 
     if DEBUG:
         log_training_data(observation_data, target_data)
 
-    observation_tensor = tf.constant(observation_data, dtype=tf.float32)
-    target_tensor = tf.constant(target_data, dtype=tf.float32)
+    mask_tensor = tf.placeholder(dtype=tf.float32, shape=(BATCH_SIZE, num_time_steps))
+
+    observation_tensor = tf.placeholder(dtype=tf.float32, shape=observation_data.shape)
+    target_tensor = tf.placeholder(dtype=tf.float32, shape=target_data.shape)
 
     output_logits = run_model(observation_tensor, output_size=TARGET_VECTOR_SIZE)
 
@@ -515,7 +532,7 @@ def train(num_training_iterations, report_interval):
         tf.expand_dims(mask_tensor, -1) * tf.sigmoid(output_logits))
 
     train_loss = calculate_loss(output_logits, target_tensor, mask_tensor,
-                                batch_size=batch_size, num_time_steps=num_time_steps)
+                                batch_size=BATCH_SIZE, num_time_steps=num_time_steps)
 
     # Set up optimizer with global norm clipping.
     trainable_variables = tf.trainable_variables()
@@ -554,7 +571,21 @@ def train(num_training_iterations, report_interval):
         total_loss = 0
 
         for train_iteration in range(start_iteration, num_training_iterations):
-            _, loss = sess.run([train_step, train_loss])
+
+            observation_data, target_data, num_time_steps = generate_data(graph_size=GRAPH_SIZE,
+                                                                          batch_size=BATCH_SIZE)
+
+            mask_data = create_mask_data(observation_data)
+
+            assert_shape(observation_data, (BATCH_SIZE, num_time_steps, INPUT_VECTOR_SIZE))
+            assert_shape(target_data, (BATCH_SIZE, num_time_steps, TARGET_VECTOR_SIZE))
+            assert_shape(mask_data, (BATCH_SIZE, num_time_steps))
+
+            _, loss = sess.run([train_step, train_loss], feed_dict={
+                observation_tensor: observation_data,
+                target_tensor: target_data,
+                mask_tensor: mask_data
+            })
             total_loss += loss
 
             if (train_iteration + 1) % report_interval == 0:
